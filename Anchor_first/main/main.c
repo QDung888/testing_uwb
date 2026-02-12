@@ -4,6 +4,7 @@
  *
  * Direct port of main_anchor.ino to ESP-IDF.
  * Responds to ranging requests from Tags using double-sided ranging protocol.
+ * Added: watchdog LED on GPIO4 blinks when no active ranging exchange.
  *
  * SPI Pin Configuration (board-specific):
  *   MOSI=12, MISO=11, SCK=10, CS=13, RST=7
@@ -32,6 +33,13 @@ static const char *TAG = "UWB_ANCHOR";
 #define PIN_NUM_RST 7
 
 // ============================================================
+// LED & Watchdog Configuration
+// ============================================================
+#define LED_PIN 4
+#define LED_BLINK_INTERVAL_MS 200
+#define RANGING_TIMEOUT_MS 100
+
+// ============================================================
 // Anchor Configuration (from .ino)
 // ============================================================
 #define ANCHOR_ID 1            // Set to 1 for Anchor 1, 2 for Anchor 2
@@ -57,6 +65,9 @@ static long long tx = 0;
 static unsigned long last_ranging_time = 0;
 static int retry_count = 0;
 
+// Watchdog: timestamp of last successful ranging completion
+static volatile unsigned long last_successful_ranging_ms = 0;
+
 // ============================================================
 // Helper: millis() equivalent
 // ============================================================
@@ -74,6 +85,37 @@ static void resetRadio(void) {
   dwm3000_clear_status(&dwm3000_dev);
   dwm3000_configure_as_tx(&dwm3000_dev);
   dwm3000_standard_rx(&dwm3000_dev);
+}
+
+// ============================================================
+// LED Watchdog Task
+// Ranging active (last success < RANGING_TIMEOUT_MS): LED solid ON.
+// Ranging inactive (no success for > RANGING_TIMEOUT_MS): LED blinks.
+// ============================================================
+
+static void led_watchdog_task(void *pvParameters) {
+  gpio_reset_pin(LED_PIN);
+  gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(LED_PIN, 0);
+
+  bool led_state = false;
+
+  while (1) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - last_successful_ranging_ms;
+
+    if (elapsed < RANGING_TIMEOUT_MS) {
+      // Ranging active: LED solid ON
+      gpio_set_level(LED_PIN, 1);
+      led_state = true;
+    } else {
+      // Ranging lost: LED blink
+      led_state = !led_state;
+      gpio_set_level(LED_PIN, led_state ? 1 : 0);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(LED_BLINK_INTERVAL_MS));
+  }
 }
 
 // ============================================================
@@ -194,6 +236,9 @@ static void anchor_loop_task(void *pvParameters) {
       dwm3000_ds_send_rt_info(&dwm3000_dev, t_roundB,
                               t_replyB); // Sends DATA packet
 
+      // Mark successful ranging for watchdog
+      last_successful_ranging_ms = millis();
+
       curr_stage = 0; // Reset for next ranging
       dwm3000_standard_rx(&dwm3000_dev);
       break;
@@ -294,6 +339,12 @@ void app_main(void) {
   dwm3000_configure_as_tx(&dwm3000_dev);
   dwm3000_clear_status(&dwm3000_dev);
   dwm3000_standard_rx(&dwm3000_dev);
+
+  // Initialize watchdog timestamp
+  last_successful_ranging_ms = millis();
+
+  // Start LED watchdog task
+  xTaskCreate(led_watchdog_task, "led_watchdog", 2048, NULL, 3, NULL);
 
   // --- Start loop() as a FreeRTOS task ---
   xTaskCreate(anchor_loop_task, "anchor_loop", 4096, NULL, 5, NULL);

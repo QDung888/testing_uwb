@@ -4,12 +4,14 @@
  *
  * Faithful port of main_tag.ino to ESP-IDF.
  * Multi-anchor double-sided ranging, serial output only.
+ * Added: timeout recovery for all stages + watchdog LED on GPIO4.
  */
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "dwm3000.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -26,6 +28,14 @@ static const char *TAG = "UWB_TAG";
 #define PIN_NUM_MOSI 12
 #define PIN_NUM_CS 13
 #define PIN_NUM_RST 7
+
+// ============================================================================
+// LED & Watchdog Configuration
+// ============================================================================
+#define LED_PIN 4
+#define LED_BLINK_INTERVAL_MS 200
+#define RANGING_TIMEOUT_MS 50
+#define STAGE_TIMEOUT_MS 30
 
 // ============================================================================
 // Scalable Anchor Configuration (matching .ino)
@@ -70,6 +80,18 @@ static dwm3000_t dwm_device;
 static anchor_data_t anchors[NUM_ANCHORS];
 static int current_anchor_index = 0;
 static int curr_stage = 0;
+
+// Watchdog: timestamp of last successful ranging completion
+static volatile unsigned long last_successful_ranging_ms = 0;
+// Timestamp when current stage started (for per-stage timeout)
+static unsigned long stage_start_ms = 0;
+
+// ============================================================================
+// Helper: millis() equivalent
+// ============================================================================
+static unsigned long millis(void) {
+  return (unsigned long)(esp_timer_get_time() / 1000);
+}
 
 // ============================================================================
 // Anchor Management Functions (matching .ino)
@@ -185,15 +207,62 @@ static void init_spi(void) {
 }
 
 // ============================================================================
-// Ranging Task (matching .ino loop())
+// LED Watchdog Task
+// When ranging is active (last success < RANGING_TIMEOUT_MS): LED solid ON.
+// When ranging is inactive (no success for > RANGING_TIMEOUT_MS): LED blinks.
+// ============================================================================
+
+static void led_watchdog_task(void *pvParameters) {
+  gpio_reset_pin(LED_PIN);
+  gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(LED_PIN, 0);
+
+  bool led_state = false;
+
+  while (1) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - last_successful_ranging_ms;
+
+    if (elapsed < RANGING_TIMEOUT_MS) {
+      // Ranging active: LED solid ON
+      gpio_set_level(LED_PIN, 1);
+      led_state = true;
+    } else {
+      // Ranging lost: LED blink
+      led_state = !led_state;
+      gpio_set_level(LED_PIN, led_state ? 1 : 0);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(LED_BLINK_INTERVAL_MS));
+  }
+}
+
+// ============================================================================
+// Ranging Task (matching .ino loop(), with timeout recovery)
 // ============================================================================
 
 static void ranging_task(void *pvParameters) {
   int rx_status;
 
+  stage_start_ms = millis();
+
   while (1) {
     anchor_data_t *current_anchor = get_current_anchor();
     int current_anchor_id = get_current_anchor_id();
+
+    // Per-stage timeout: if stuck in stage 1 or 3 (waiting for RX) too long,
+    // reset back to stage 0 and re-initiate
+    if ((curr_stage == 1 || curr_stage == 3) &&
+        (millis() - stage_start_ms > STAGE_TIMEOUT_MS)) {
+      printf("[TIMEOUT] Tag stuck in stage %d for Anchor %d, resetting\n",
+             curr_stage, current_anchor_id);
+      dwm3000_clear_status(&dwm_device);
+      dwm3000_configure_as_tx(&dwm_device);
+      dwm3000_clear_status(&dwm_device);
+      curr_stage = 0;
+      stage_start_ms = millis();
+      switch_to_next_anchor();
+    }
 
     switch (curr_stage) {
 
@@ -205,6 +274,7 @@ static void ranging_task(void *pvParameters) {
       dwm3000_ds_send_frame(&dwm_device, 1);
       current_anchor->tx = dwm3000_read_tx_timestamp(&dwm_device);
       curr_stage = 1;
+      stage_start_ms = millis();
       break;
 
     case 1: // Await first response (matching .ino case 1)
@@ -217,13 +287,16 @@ static void ranging_task(void *pvParameters) {
                    current_anchor_id);
             printf("%.2f dBm\n", dwm3000_get_signal_strength(&dwm_device));
             curr_stage = 0;
+            stage_start_ms = millis();
           } else if (dwm3000_ds_get_stage(&dwm_device) != 2) {
             printf("[WARNING] Unexpected stage from Anchor %d: %d\n",
                    current_anchor_id, dwm3000_ds_get_stage(&dwm_device));
             dwm3000_ds_send_error_frame(&dwm_device);
             curr_stage = 0;
+            stage_start_ms = millis();
           } else {
             curr_stage = 2;
+            stage_start_ms = millis();
           }
         } else {
           printf("[ERROR] Receiver Error from Anchor %d\n", current_anchor_id);
@@ -240,6 +313,7 @@ static void ranging_task(void *pvParameters) {
       current_anchor->t_replyA = (int)(current_anchor->tx - current_anchor->rx);
 
       curr_stage = 3;
+      stage_start_ms = millis();
       break;
 
     case 3: // Await second response (matching .ino case 3)
@@ -250,10 +324,12 @@ static void ranging_task(void *pvParameters) {
           if (dwm3000_ds_is_error_frame(&dwm_device)) {
             printf("[WARNING] Error frame from Anchor %d\n", current_anchor_id);
             curr_stage = 0;
+            stage_start_ms = millis();
           } else {
             current_anchor->clock_offset =
                 dwm3000_get_raw_clock_offset(&dwm_device);
             curr_stage = 4;
+            stage_start_ms = millis();
           }
         } else {
           printf("[ERROR] Receiver Error from Anchor %d\n", current_anchor_id);
@@ -283,14 +359,19 @@ static void ranging_task(void *pvParameters) {
              current_anchor->filtered_distance,
              current_anchor->signal_strength);
 
+      // Mark successful ranging for watchdog
+      last_successful_ranging_ms = millis();
+
       // Switch to next anchor
       switch_to_next_anchor();
       curr_stage = 0;
+      stage_start_ms = millis();
       break;
 
     default:
       printf("Entered stage (%d). Reverting back to stage 0\n", curr_stage);
       curr_stage = 0;
+      stage_start_ms = millis();
       break;
     }
 
@@ -372,6 +453,12 @@ void app_main(void) {
 
   dwm3000_configure_as_tx(&dwm_device);
   dwm3000_clear_status(&dwm_device);
+
+  // Initialize watchdog timestamp
+  last_successful_ranging_ms = millis();
+
+  // Start LED watchdog task
+  xTaskCreate(led_watchdog_task, "led_watchdog", 2048, NULL, 3, NULL);
 
   // Start ranging task
   xTaskCreate(ranging_task, "ranging_task", 8192, NULL, 5, NULL);
